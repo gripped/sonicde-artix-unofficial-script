@@ -33,10 +33,10 @@ Directory where the chroot is created and the resulting packages and PKGBUILD's 
 If sign_packages =True set the rest with the location names and fingerprint of your keys.
 
 **print_sys_cmds**  
-If true system commands (subprocess.Popen) used will be output.
+If True system commands (subprocess.Popen) used will be output.
 
 **quiet**  
-Suppress much output.
+Suppress much output if True.
 
 **safe_efi**  
 If True will remount /sys/firmware/efi/efivars read only then back to rw at the end.
