@@ -49,6 +49,7 @@ If True the last commit is saved to /var/tmp/sonicde-artix-unofficial/commit and
 added to the temporary makepkg.conf
 
 **user**  
-The user name to run the part of the script that don't run as root. If unset uid 1000 is used.
+The user name to run the parts of the script that don't run as root.
+If unset uid 1000 is used. Which will fail if there is no uid 1000.
 
 Git must be installed.
