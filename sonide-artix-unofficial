@@ -1,0 +1,599 @@
+#!/usr/bin/python -u
+#
+#  sonide-artix-unofficial
+#
+
+import fileinput
+import glob
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import pwd
+from pathlib import Path
+
+# Options
+ccache = False
+ccache_dir = '/media/Spare_SSD/ccache'
+cleanup = False
+cwd = '' # Set this to an existing dir or your cwd will be used. I.e. the dir you run the script from.
+key_dir = '/root/sonicde-key'
+key_fp = '8F74E8CCCB380B1D598B13C8FFA739AC998BD51A'
+key_private_name = 'sonicde-artix-unofficial-private.asc'
+key_public_name = 'sonicde-artix-unofficial-public.asc'
+print_sys_cmds = True
+quiet = False
+safe_efi = True
+save_last_commit = False
+sign_packages = False
+packager = 'bob not@here.com'
+user = ''
+# End options
+
+
+class Color:
+    CYAN = '\033[34m'
+    ORANGE = '\033[33m'
+    GREEN = '\033[36m'
+    RED = '\033[31m'
+    END = '\033[0m'
+
+
+def add_repo():
+    os.chdir('/packages')
+    colprint('Creating repo from packages', Color.CYAN)
+    run_command(f'repo-add {'--include-sigs ' if sign_packages else ''} sonicde-artix-unofficial.db.tar.gz *pkg.tar.zst', EXIT_CODE, shell=True)
+
+
+def build_sonicde_packages():
+    packages_built = 0
+    suceeded = []
+    order = ['sonic-frameworks-cmake-modules', 'sonic-frameworks-open-collab', 'sonic-frameworks-gui-addons', 'sonic-frameworks-quick-ui', 'sonic-frameworks-doctools', 'sonic-decoration',
+             'sonic-quick-image-editor', 'sonic-workspace-wallpapers', 'sonic-frameworks-silver-icons', 'sonic-screen-library', 'sonic-frameworks-keybind', 'sonic-frameworks-windowsystem',
+             'sonic-frameworks-idle-tracker', 'sonic-frameworks-core-addons', 'sonic-frameworks-color-scheme', 'sonic-pipewire', 'sonic-activities', 'sonic-frameworks-auth', 'sonic-frameworks-icon-themes',
+             'sonic-night-light', 'sonic-frameworks-runner', 'sonic-activities-stats', 'sonic-frameworks-quick-ui-addons', 'sonic-frameworks-settings-ui', 'sonic-breeze', 'sonic-frameworks-quick-silver-style',
+             'sonic-silver', 'sonic-system-monitor-library', 'sonic-silver-gtk', 'sonic-gtk-theme-bridge', 'sonic-frameworks-io', 'sonic-dr-robotnik', 'sonic-frameworks-io-fuse', 'sonic-qt-theme-bridge',
+             'sonic-screenies', 'sonic-terminal', 'sonic-terminal-tools', 'sonic-frameworks-io-extras', 'sonic-system-info', 'sonic-interface-libraries', 'sonic-keybind-daemon', 'sonic-ecco', 'sonic-screen',
+             'sonic-screenlocker', 'sonic-bluetooth-runtime', 'sonic-win', 'sonic-workspace', 'sonic-browser-integration', 'sonic-login-manager', 'sonic-workspace-addons', 'sonic-silver-sddm',
+             'sonic-network-manager', 'xdg-desktop-portal-sonicde', 'sonic-desktop-interface', 'sonic-audio-applet-pulse', 'sonic-welcome-center', 'sonicde-meta']
+    colprint('Building packages', Color.CYAN)
+    for p_dir in order:
+        depends = get_depends(p_dir)
+        if depends:
+            exit_code = run_command(f'pacman -Syu --noconfirm {' '.join(depends)}', EXIT_CODE)
+            if exit_code != 0:
+                continue
+        os.chdir(os.path.join(chroot_git_dir, p_dir))
+        switch_to_user(normal_user)
+        colprint(f'Building package ¬{p_dir}¬', Color.CYAN)
+        exit_code = run_command(f'GNUPGHOME=/home/user/.gnupg makepkg -srC {'--sign ' if sign_packages else ''}--skippgpcheck --noconfirm --config /makepkg.conf', EXIT_CODE, shell=True)
+        switch_to_user(ROOT)
+        if exit_code == 0:
+            install_packages(p_dir)
+            packages_built += 1
+            suceeded.append(p_dir)
+    while packages_built != number_of_sonicde_packages:
+        this_loop = packages_built
+        for p_dir in package_dirs:
+            if p_dir in suceeded:
+                continue
+            depends = get_depends(p_dir)
+            if depends:
+                exit_code = run_command(f'pacman -Syu --noconfirm {' '.join(depends)}', EXIT_CODE)
+                if exit_code != 0:
+                    continue
+            os.chdir(os.path.join(chroot_git_dir, p_dir))
+            switch_to_user(normal_user)
+            colprint(f'Building package ¬{p_dir}¬', Color.CYAN)
+            exit_code = run_command(f'GNUPGHOME=/home/user/.gnupg makepkg -srC {'--sign ' if sign_packages else ''}--skippgpcheck --noconfirm --config /makepkg.conf', EXIT_CODE, shell=True)
+            switch_to_user(ROOT)
+            if exit_code == 0:
+                install_packages(p_dir)
+                packages_built += 1
+                suceeded.append(p_dir)
+        if packages_built == this_loop:
+            break
+    if packages_built < number_of_sonicde_packages:
+        global missing
+        missing = [x for x in package_dirs if x not in suceeded]
+        sys.exit(1)
+    return suceeded
+
+
+def check_last_commit():
+    def get_saved_commit():
+        if Path('/var/tmp/sonicde-artix-unofficial/commit').is_file():
+            with open('/var/tmp/sonicde-artix-unofficial/commit') as file:
+                commit = file.readline().strip()
+        else:
+            commit = ''
+        return commit
+    global repo_last_commit
+    repo_last_commit = run_command(f'git -C {git_dir} rev-parse HEAD', OUTPUT).strip()
+    saved_commit = get_saved_commit()
+    if repo_last_commit == saved_commit:
+        return True
+    return False
+
+
+def chroot_exit():
+    colprint('Leaving chroot', Color.CYAN)
+    os.fchdir(root_dir_fd)
+    os.chroot('.')
+    os.close(root_dir_fd)
+    sys_mounts = ['dev', 'proc', 'sys']
+    for sys_mount in sys_mounts:
+        run_command(f'umount -vR {chroot_dir}/{sys_mount}', EXIT_CODE)
+    run_command(f'umount -vR {chroot_dir}', EXIT_CODE)
+    mnts_not_gone = run_command(f"mount |grep {chroot_dir} | awk '{{print $3}}'", OUTPUT, shell=True).replace('\n', ' ').split(' ')[:-1]
+    if mnts_not_gone:
+        run_command(f'umount -vl {chroot_dir}', EXIT_CODE)
+    mnts_not_gone = run_command(f"mount |grep {chroot_dir} | awk '{{print $3}}'", OUTPUT, shell=True).replace('\n', ' ').split(' ')[:-1]
+    if mnts_not_gone:
+        return False
+    if safe_efi:
+        run_command('mount -o remount,rw /sys/firmware/efi/efivars', EXIT_CODE)
+    return True
+
+
+def chroot_make():
+    def chroot_artix_strap():
+        if run_command(f'git clone https://github.com/gripped/artix-bootstrap.git {build_dir}/artix-bootstrap', EXIT_CODE) != 0:
+            return False
+        os.chdir(f'{build_dir}/artix-bootstrap')
+        [print(line.replace('${INIT} elogind-${INIT}', 'base-devel'), end='') for line in fileinput.input('artix-bootstrap.sh', inplace=True)]
+        colprint('Running artix-bootstrap. Could take a while....', Color.CYAN)
+        if run_command(f"./artix-bootstrap.sh {chroot_dir}", EXIT_CODE) != 0:
+            return False
+        return True
+
+    colprint(f'Setting up chroot', Color.CYAN)
+    if safe_efi:
+        if run_command('mount -o remount,ro /sys/firmware/efi/efivars', EXIT_CODE) != 0:
+            colprint('Failed to remount efivar read only. Exiting', Color.RED)
+            sys.exit(1)
+    with open(f'{chroot_dir}/.chroot', 'w') as file:
+        file.write('')
+    if not chroot_artix_strap():
+        colprint('Failed to bootstrap Artix. Exiting', Color.RED)
+        sys.exit(1)
+
+
+def chroot_setup():
+    def chroot_mounts():
+        total_exit_code = 0
+        exit_code = run_command(f"mount -v --bind {chroot_dir} {chroot_dir}", EXIT_CODE)
+        total_exit_code += exit_code
+        exit_code = run_command(f"mount -v --types proc /proc {chroot_dir}/proc", EXIT_CODE)
+        total_exit_code += exit_code
+        exit_code = run_command(f"mount -v --rbind --make-rslave /sys {chroot_dir}/sys", EXIT_CODE)
+        total_exit_code += exit_code
+        exit_code = run_command(f"mount -v --rbind --make-rslave /dev {chroot_dir}/dev", EXIT_CODE)
+        total_exit_code += exit_code
+        if sign_packages:
+            os.mkdir(f'{chroot_dir}/key')
+            exit_code = run_command(f"mount -v --bind {key_dir} {chroot_dir}/key", EXIT_CODE)
+            total_exit_code += exit_code
+            shutil.copy(os.path.join(chroot_dir, 'key', key_private_name), os.path.join(chroot_dir, 'key', 'temp.asc'))
+            os.chown(os.path.join(chroot_dir, 'key', 'temp.asc'), normal_user[0], normal_user[1])
+        if ccache:
+            os.mkdir(f'{chroot_dir}/ccache')
+            exit_code = run_command(f"mount -v --bind {ccache_dir} {chroot_dir}/ccache", EXIT_CODE)
+            total_exit_code += exit_code
+        if total_exit_code:
+            return False
+        return True
+
+    chroot_make()
+    os.chdir(chroot_dir)
+    if not chroot_mounts():
+        colprint('bind mounts failed. Exiting', Color.RED)
+        sys.exit(1)
+    os.chroot(chroot_dir)
+    if not Path('/.chroot').exists():
+        colprint("We don't seem to be in the chroot? Exiting", Color.RED)
+        sys.exit(1)
+    total_exit_code = 0
+    exit_code = run_command(r"sed -i 's/^#en_GB.UTF-8 UTF-8/en_GB.UTF-8 UTF-8/' /etc/locale.gen", EXIT_CODE)
+    total_exit_code += exit_code
+    exit_code = run_command("locale-gen", EXIT_CODE)
+    total_exit_code += exit_code
+    with open("/etc/locale.conf", "w") as f:
+        f.write("LANG=en_GB.UTF-8\n")
+    os.environ["LANG"] = "en_GB.UTF-8"
+    os.environ["LC_ALL"] = "en_GB.UTF-8"
+    if ccache:
+        os.environ["CCACHE_DIR"] = "/ccache"
+        os.environ["LC_ALL"] = "en_GB.UTF-8"
+    exit_code = run_command('pacman-key --init', EXIT_CODE)
+    total_exit_code += exit_code
+    exit_code = run_command('pacman-key --populate artix', EXIT_CODE)
+    total_exit_code += exit_code
+    exit_code = run_command(f"pacman -Syu --noconfirm {'ccache ' if ccache else ''}", EXIT_CODE)
+    total_exit_code += exit_code
+    if sign_packages:
+        exit_code = run_command(f'pacman-key --add /key/{key_public_name}', EXIT_CODE)
+        total_exit_code += exit_code
+        exit_code = run_command(f'pacman-key --finger {key_fp}', EXIT_CODE)
+        total_exit_code += exit_code
+        exit_code = run_command(f'pacman-key --lsign-key {key_fp}', EXIT_CODE)
+        total_exit_code += exit_code
+        exit_code = run_command('useradd -m user', EXIT_CODE)
+        total_exit_code += exit_code
+        switch_to_user(normal_user)
+        exit_code = run_command('GNUPGHOME=/home/user/.gnupg gpg --import /key/temp.asc', EXIT_CODE, shell=True)
+        total_exit_code += exit_code
+        switch_to_user(ROOT)
+        os.remove('/key/temp.asc')
+    if total_exit_code:
+        return False
+    return True
+
+
+def colprint(text, color=Color.END):
+    parts = text.split('¬')
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            print(color, end='')
+        else:
+            print(Color.END, end='')
+        print(part, end='')
+    print(f'{Color.END}')
+
+
+def edit_pkgbuilds():
+    fix_srcinfo = []
+    colprint("Editing PKGBUILD's", Color.CYAN)
+    for p_dir in package_dirs:
+        new_lines = []
+        pkgbuild = os.path.join(chroot_git_dir, p_dir, 'PKGBUILD')
+        with open(pkgbuild, 'r') as file:
+            pkgbuild_lines = file.readlines()
+        for line in pkgbuild_lines:
+            if 'systemd-libs' in line:
+                line = line.replace('systemd-libs', '')
+                fix_srcinfo.append(p_dir)
+            if 'package(' in line:
+                line = line + f'\n  rm -Rf $pkgdir/usr/lib/systemd\n'
+            new_lines.append(line)
+        with open(pkgbuild, 'w') as file:
+            file.writelines(new_lines)
+        match p_dir:
+            case 'sonic-desktop-interface':
+                with open(pkgbuild, 'r') as file:
+                    new_lines = []
+                    pkgbuild_lines = file.readlines()
+                    for line in pkgbuild_lines:
+                        if 'baloo' in line:
+                            line = line.replace('baloo', 'baloo elogind')
+                        new_lines.append(line)
+                    with open(pkgbuild, 'w') as file:
+                        file.writelines(new_lines)
+                    if p_dir not in fix_srcinfo:
+                        fix_srcinfo.append(p_dir)
+            case 'sonic-frameworks-core-addons':
+                with open(pkgbuild, 'r') as file:
+                    new_lines = []
+                    pkgbuild_lines = file.readlines()
+                    for line in pkgbuild_lines:
+                        if 'glibc' in line:
+                            line = line.replace('glibc', 'glibc dbus')
+                        new_lines.append(line)
+                    with open(pkgbuild, 'w') as file:
+                        file.writelines(new_lines)
+                    if p_dir not in fix_srcinfo:
+                        fix_srcinfo.append(p_dir)
+            case 'sonic-win':
+                with open(pkgbuild, 'r') as file:
+                    new_lines = []
+                    pkgbuild_lines = file.readlines()
+                    for line in pkgbuild_lines:
+                        if 'dbus' in line:
+                            line = line.replace('dbus', 'elogind')
+                        new_lines.append(line)
+                    with open(pkgbuild, 'w') as file:
+                        file.writelines(new_lines)
+                    if p_dir not in fix_srcinfo:
+                        fix_srcinfo.append(p_dir)
+            case 'sonic-dr-robotnik':
+                with open(pkgbuild, 'r') as file:
+                    new_lines = []
+                    pkgbuild_lines = file.readlines()
+                    for line in pkgbuild_lines:
+                        if '-DENABLE_SYSTEMD_COREDUMP=ON' in line:
+                            line = line.replace('-DENABLE_SYSTEMD_COREDUMP=ON', '-DENABLE_SYSTEMD_COREDUMP=OFF')
+                        new_lines.append(line)
+                    with open(pkgbuild, 'w') as file:
+                        file.writelines(new_lines)
+                    if p_dir not in fix_srcinfo:
+                        fix_srcinfo.append(p_dir)
+            case 'sonic-breeze-sddm':
+                with open(pkgbuild, 'r') as file:
+                    new_lines = []
+                    pkgbuild_lines = file.readlines()
+                    for line in pkgbuild_lines:
+                        if line == "url='https://github.com/Sonic-DE/breeze-sddm'\n":
+                            line = "url='https://github.com/Sonic-DE/sonic-breeze-sddm'\n"
+                        if '0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5' in line:
+                            line = "sha256sums=('8bbc86dc8213f62919de6e882a4a877bbfd1232de3ad1d9ef665ae0f82605c04')\n"
+                        new_lines.append(line)
+                    with open(pkgbuild, 'w') as file:
+                        file.writelines(new_lines)
+                    if p_dir not in fix_srcinfo:
+                        fix_srcinfo.append(p_dir)
+    return fix_srcinfo
+
+
+def get_conflicts(lines):
+    content = ''.join(lines)
+    pattern = re.compile(r'conflicts\s*=\s*\(([^)]*)\)', re.IGNORECASE | re.DOTALL)
+    matches = pattern.findall(content)
+    all_conflicts = []
+    for match in matches:
+        tokens = match.split()
+        for token in tokens:
+            token = token.strip('\'"')
+            all_conflicts.append(token)
+    return all_conflicts
+
+
+def get_depends(pkg_dir):
+    colprint(f'Installing dependacies for ¬{pkg_dir}¬', Color.CYAN)
+    pkg_build_dir = os.path.join(chroot_git_dir, pkg_dir)
+    if not Path(f'{pkg_build_dir}/.SRCINFO').exists():
+        colprint("No ¬.SRCINFO¬ Creating one", Color.CYAN)
+        os.chdir(pkg_build_dir)
+        switch_to_user(normal_user)
+        if run_command(f"makepkg --printsrcinfo > .SRCINFO", EXIT_CODE, shell=True):
+            colprint(f"Failed to create ¬.SRCINFO¬ . Exiting", Color.RED)
+            sys.exit(1)
+        switch_to_user(ROOT)
+    with open(f'{pkg_build_dir}/.SRCINFO') as file:
+        lines = file.readlines()
+    depend_list = []
+    for line in lines:
+        if line.strip().startswith('depends') or line.strip().startswith('makedepends') or line.strip().startswith('checkdepends'):
+            pkg_name = line.split('=')[1].strip()
+            if run_command(f'pacman -Qq {pkg_name}', EXIT_CODE) != 0:
+                depend_list.append(pkg_name)
+    return depend_list
+
+
+def get_repo():
+    colprint('Cloning ¬https://github.com/sonicde-arch/sonicde-arch¬', Color.CYAN)
+    if run_command(f'git clone https://github.com/sonicde-arch/sonicde-arch {git_dir}', EXIT_CODE) == 0:
+        if save_last_commit:
+            last_commit = check_last_commit()
+            if last_commit:
+                colprint('No new commits. Nothing to do, exiting.', Color.CYAN)
+                sys.exit(1)  # For external script to stop
+        os.chdir(git_dir)
+        shutil.rmtree('.git')
+        shutil.rmtree('.github')
+        shutil.rmtree('docs')
+        os.remove('README.md')
+        os.remove('sonicde-archlinux.asc')
+        os.remove('sonic-switch.sh')
+        return True
+    return False
+
+
+def get_user():
+    if user:
+        uid = pwd.getpwnam(user).pw_uid
+        gid = pwd.getpwnam(user).pw_gid
+    else:
+        uid = 1000
+        gid = pwd.getpwuid(uid).pw_gid
+    return [uid, gid]
+
+
+def install_packages(pkg_name):
+    lookup = {entry['sonicde']: entry['plasma'] for entry in plasma_equivalents}
+    plasma_list = lookup.get(pkg_name, [])
+    if pkg_name == 'sonic-frameworks-io':
+        pass
+    for plasma_pkg in plasma_list:
+        if run_command(f'pacman -Qq {plasma_pkg}', EXIT_CODE) == 0:
+            colprint(f"Removing conflicting ¬{plasma_pkg}¬ before installing ¬{pkg_name}¬", Color.CYAN)
+            run_command(f'pacman -Rdd --noconfirm {plasma_pkg}', EXIT_CODE)
+    pkgs_built = glob.glob('*.pkg.tar.zst')
+    for pkg in pkgs_built:
+        shutil.copy(pkg, f'/packages/{pkg}')
+        if sign_packages:
+            shutil.copy(f'{pkg}.sig', f'/packages/{pkg}.sig')
+        colprint(f'Installing package ¬{pkg}¬', Color.CYAN)
+        run_command(f'pacman -U --noconfirm {pkg}', EXIT_CODE)
+
+
+def list_dirs():
+    contents = os.listdir(git_dir)
+    pkg_dirs = []
+    for file in contents:
+        if (Path(git_dir) / file).is_dir():
+            pkg_dirs.append(file)
+    return pkg_dirs
+
+
+def make_new_srcinfos():
+    colprint("Updating .SRCINFO's", Color.CYAN)
+    switch_to_user(normal_user)
+    for p_dir in src_infos:
+        os.chdir(os.path.join(chroot_git_dir, p_dir))
+        run_command('makepkg --printsrcinfo > .SRCINFO', EXIT_CODE, shell=True)
+    switch_to_user(ROOT)
+
+
+def plasma_equivs():
+    equiv_list = []
+    for p_dir in package_dirs:
+        pkgbuild = os.path.join(os.path.join(chroot_git_dir, p_dir, 'PKGBUILD'))
+        with open(pkgbuild) as file:
+            pkgbuild_lines = file.readlines()
+        equiv = get_conflicts(pkgbuild_lines)
+        equiv_list.append({
+            'plasma': equiv,
+            'sonicde': p_dir
+        })
+    if not quiet:
+        colprint('List of installed sonicde packages and their plasma equivalents.', Color.CYAN)
+        for equiv in equiv_list:
+            print(f"sonicde: {equiv['sonicde']:<40} plasma: {', '.join(equiv['plasma'])}")
+    return equiv_list
+
+
+def run_command(cmd, opt, shell=False):
+    try:
+        if print_sys_cmds:
+            colprint(f'{cmd}', Color.GREEN)
+        if not shell:
+            cmd = shlex.split(cmd)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell, text=True, user=os.geteuid(), group=os.getegid())
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
+        stdout_lines = []
+        while True:
+            stdout_line = process.stdout.readline()
+            stderr_line = process.stderr.readline()
+            if stdout_line:
+                stdout_lines.append(stdout_line)
+                if not quiet:
+                    print(stdout_line, end='')
+            if stderr_line:
+                if not quiet:
+                    print(stderr_line, end='')
+            if process.poll() is not None and stdout_line == '' and stderr_line == '':
+                break
+        if opt == OUTPUT:
+            return ''.join(stdout_lines)
+        if opt == EXIT_CODE:
+            return process.returncode
+    except Exception as e:
+        colprint(*e.args, Color.RED)
+        if opt == OUTPUT:
+            return 'Error'
+        if opt == EXIT_CODE:
+            return 1
+
+
+def switch_to_user(usr):
+    os.setegid(usr[1])
+    os.seteuid(usr[0])
+
+
+def tmp_mkpkg_conf():
+    colprint("Creating temporary ¬makepkg.conf¬", Color.CYAN)
+    with open(f'/etc/makepkg.conf', 'r') as file:
+        lines = file.readlines()
+        if sign_packages:
+            for i, line in enumerate(lines):
+                if line.lstrip().startswith('PACKAGER='):
+                    lines[i] = f'PACKAGER="{packager}"\n'
+                if line.lstrip().startswith('GPGKEY='):
+                    lines[i] = f'GPGKEY="{key_fp}"\n'
+                if line.lstrip().startswith('BUILDENV=('):
+                    target = 'ccache' if ccache else '!ccache'
+                    if re.search(r'\b!?ccache\b', line):
+                        lines[i] = re.sub(r'\b!?ccache\b', target, line)
+                    else:
+                        lines[i] = re.sub(r'(BUILDENV=\()([^)]*)(\))', rf'\1\2 {target}\3', line)
+
+    with open(f'{chroot_dir}/makepkg.conf', 'w') as file:
+        file.writelines(lines)
+
+
+OUTPUT = "OUTPUT"
+EXIT_CODE = "EXIT"
+root_dir_fd = os.open("/", os.O_RDONLY)
+ROOT = [0, 0]
+failed = False
+missing = ''
+safe_exit_code = 0
+repo_last_commit = ''
+
+try:
+    if not cwd:
+        cwd = os.getcwd()
+    else:
+        if not Path(cwd).is_dir():
+            colprint(f'¬{cwd}¬ is not a directory. Exiting', Color.RED)
+            sys.exit(3)
+    normal_user = get_user()
+    chroot_dir = f'{cwd}/chroot'
+    build_dir = f'{chroot_dir}/build'
+    packages_dir = f'{chroot_dir}/packages'
+    if not Path(chroot_dir).exists():
+        os.mkdir(chroot_dir)
+    else:
+        colprint(f'¬{chroot_dir}¬ exists. Exiting', Color.RED)
+        sys.exit(3)
+    os.mkdir(build_dir)
+    if Path(f'{cwd}/pkgbuilds').exists() or Path(f'{cwd}/packages').exists():
+        colprint(f'Delete or move pkgbuilds and/or packages from ¬{cwd}¬')
+        sys.exit(1)
+    os.mkdir(packages_dir)
+    os.chown(chroot_dir, normal_user[0], normal_user[1])
+    os.chown(build_dir, normal_user[0], normal_user[1])
+    os.chown(packages_dir, normal_user[0], normal_user[1])
+    git_dir = f'{build_dir}/sonicde-arch'
+    switch_to_user(normal_user)
+    if not get_repo():
+        colprint(f'failed to clone sonicde-arch. Exiting', Color.RED)
+        sys.exit(1)
+    switch_to_user(ROOT)
+    package_dirs = list_dirs()
+    tmp_mkpkg_conf()
+    if not chroot_setup():
+        colprint('chroot setup failed. Exiting', Color.RED)
+        sys.exit(1)
+    chroot_git_dir = '/build/sonicde-arch'
+    number_of_sonicde_packages = len(package_dirs)
+    switch_to_user(ROOT)
+    plasma_equivalents = plasma_equivs()
+    src_infos = edit_pkgbuilds()
+    run_command(f'cp -av {chroot_git_dir} /pkgbuilds', EXIT_CODE)
+    make_new_srcinfos()
+    order_built = build_sonicde_packages()
+    if not quiet:
+        colprint(f'Packages built in this order\n{order_built}', Color.ORANGE)
+    add_repo()
+    if not chroot_exit():
+        colprint('Failed to cleanly exit chroot. Exiting', Color.RED)
+        sys.exit(1)
+    shutil.move(packages_dir, f'{cwd}/packages')
+    shutil.move(f'{chroot_dir}/pkgbuilds', f'{cwd}/pkgbuilds')
+    if save_last_commit:
+        if not Path('/var/tmp/sonicde-artix-unofficial').exists():
+            os.mkdir('/var/tmp/sonicde-artix-unofficial')
+        with open('/var/tmp/sonicde-artix-unofficial/commit', 'w') as file:
+            file.write(repo_last_commit)
+except (Exception, SystemExit) as e:
+    switch_to_user(ROOT)
+    safe_exit_code = e.code
+    failed = True
+    if not isinstance(e, SystemExit):
+        colprint("Something went wrong. Possibly the next line will tell you more? Exiting", Color.RED)
+        colprint(' '.join(map(str, e.args)), Color.RED)
+    if Path('/.chroot').exists():
+        if not chroot_exit():
+            colprint('Failed to cleanly exit chroot', Color.RED)
+    failed = True
+
+finally:
+    if cleanup and safe_exit_code != 3:
+        if chroot_dir and Path(chroot_dir).is_dir() and 'chroot_dir' in globals():
+            mnts_not_gone = run_command(f"mount |grep {chroot_dir} | awk '{{print $3}}'", OUTPUT, shell=True).replace('\n', ' ').split(' ')[:-1]
+            if not mnts_not_gone:
+                colprint(f"Removing chroot ¬{chroot_dir}¬", Color.CYAN)
+                shutil.rmtree(chroot_dir)
+            else:
+                colprint(f'Some bind mounts are still mounted ¬{mnts_not_gone}¬. Exiting', Color.RED)
+                sys.exit(1)
+        else:
+            sys.exit(1)
+    if missing:
+        colprint(f'{missing} not built', Color.ORANGE)
+    if failed:
+        sys.exit(1)
